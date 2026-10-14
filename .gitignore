@@ -1,0 +1,32 @@
+# Godot
+.godot/
+export/
+*.translation
+
+# Local play / cache
+_userdata_play/
+__pycache__/
+
+# Debug / probe artifacts
+_*.png
+_*.log
+_*.txt
+_*.import
+_dbg_*
+*.import.bak
+
+# Tools (installers, blender, archives, logs, previews)
+_tools/*.zip
+_tools/*.msi
+_tools/blender*/
+_tools/*.blend1
+_tools/*.log
+_tools/*.log.err
+_tools/*_preview*.png
+_tools/*_preview*.png.import
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
