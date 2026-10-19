@@ -7,11 +7,32 @@ const HALF: float = 48.0
 const MAX_EXPAND: int = 4500
 
 static var _dirty: bool = true
+static var navigation_revision: int = 0
+static var search_count: int = 0
+static var last_path_report: Dictionary = {}
+static var search_durations_usec: Array[int] = []
+
+static func diagnostic_snapshot() -> Dictionary:
+	return {
+		"dirty": _dirty,
+		"navigation_revision": navigation_revision,
+		"blocked_cells": _blocked.size(),
+		"dimensions": _dim,
+		"search_count": search_count,
+		"search_duration_samples": search_durations_usec.size(),
+	}
+static var _search_started_usec: int = 0
 static var _blocked: Dictionary = {}  # "ix,iz" -> true
 static var _dim: int = 0
 
+static func reset_measurements() -> void:
+	search_count = 0
+	search_durations_usec.clear()
+	last_path_report.clear()
+
 static func invalidate() -> void:
 	_dirty = true
+	navigation_revision += 1
 
 static func _key(ix: int, iz: int) -> String:
 	return "%d,%d" % [ix, iz]
@@ -165,22 +186,119 @@ static func _heuristic(a: Vector2i, b: Vector2i) -> float:
 	var dz: float = float(absi(a.y - b.y))
 	return (dx + dz) + 0.414 * minf(dx, dz)  # octile
 
+static func _record_path(path: Array, report: Dictionary) -> Array:
+	var duration_usec: int = maxi(0, int(Time.get_ticks_usec() - _search_started_usec))
+	report["duration_usec"] = duration_usec
+	if search_durations_usec.size() < 100000:
+		search_durations_usec.append(duration_usec)
+	if not path.is_empty():
+		var route_end: Vector3 = path[path.size() - 1]
+		var resolved_goal: Vector3 = report.get("resolved_goal", Vector3.ZERO)
+		report["route_end"] = route_end
+		report["route_distance_to_resolved_goal"] = route_end.distance_to(resolved_goal)
+	last_path_report = report.duplicate(true)
+	return path
+
 static func find_path(from: Vector3, to: Vector3, tree: SceneTree) -> Array:
 	## Returns waypoints from near-from to to (may be empty → go straight).
+	search_count += 1
+	_search_started_usec = Time.get_ticks_usec()
 	if _dirty:
 		rebuild(tree)
 	var start: Vector2i = world_to_cell(from)
 	var goal: Vector2i = world_to_cell(to)
-	if not _in_bounds(start) or not _in_bounds(goal):
-		return [Vector3(to.x, 0, to.z)]
+	var start_outside: bool = not _in_bounds(start)
+	var goal_outside: bool = not _in_bounds(goal)
+	var requested_start: Vector2i = start
+	var requested_goal: Vector2i = goal
+	# Horde units spawn just beyond the coarse map boundary. Clamp their search
+	# anchor to the nearest edge cell, then keep that anchor as an explicit first
+	# waypoint so the live segment from the spawn position is checked as well.
+	start = Vector2i(clampi(start.x, 0, _dim - 1), clampi(start.y, 0, _dim - 1))
+	# Orders outside the map stop at the nearest map edge instead of becoming a
+	# direct off-grid walk or a stationary unit.
+	goal = Vector2i(clampi(goal.x, 0, _dim - 1), clampi(goal.y, 0, _dim - 1))
+	# The coarse grid expands solid footprints for clearance, so a safe stand
+	# position can land in a blocked cell. Only treat the actual target as
+	# blocked when the collision geometry also rejects it.
+	var physical_blockers: Array[Dictionary] = _world_blockers_at(to, tree)
+	var target_blocked: bool = goal_outside or not physical_blockers.is_empty()
+	var target_grid_blocked: bool = is_blocked_cell(goal)
 	# If start blocked, nudge to nearest free
 	start = _nearest_free(start)
 	goal = _nearest_free(goal)
+	var resolved_goal: Vector3 = cell_to_world(goal) if target_blocked else Vector3(to.x, 0.0, to.z)
+	var report: Dictionary = {
+		"requested_from": from,
+		"requested_goal": Vector3(to.x, 0.0, to.z),
+		"requested_start_cell": [requested_start.x, requested_start.y],
+		"requested_goal_cell": [requested_goal.x, requested_goal.y],
+		"start_outside_map": start_outside,
+		"goal_outside_map": goal_outside,
+		"start_cell_blocked_before_projection": is_blocked_cell(requested_start),
+		"goal_cell_blocked_before_projection": target_grid_blocked,
+		"physical_goal_blocked": not physical_blockers.is_empty(),
+		"physical_blockers": physical_blockers,
+		"projected_goal_cell": [goal.x, goal.y],
+		"resolved_goal": resolved_goal,
+		"navigation_revision": navigation_revision,
+		"grid_dimensions": [_dim, _dim],
+		"grid_cell_count": _dim * _dim,
+		"max_expand_limit": MAX_EXPAND,
+		"search_reason": "not_started",
+		"expanded_nodes": 0,
+		"remaining_open_nodes": 0,
+		"search_reached_goal": false,
+	}
+	var start_anchor: Vector3 = cell_to_world(start)
+	var start_anchor_clear: bool = not start_outside or _world_segment_clear(from, start_anchor, tree)
+	if start_outside and not start_anchor_clear:
+		for radius in range(1, _dim + 1):
+			var entry := start
+			var best_distance: float = INF
+			for dx in range(-radius, radius + 1):
+				for dz in range(-radius, radius + 1):
+					if absi(dx) != radius and absi(dz) != radius:
+						continue
+					var candidate := Vector2i(start.x + dx, start.y + dz)
+					if not _in_bounds(candidate) or is_blocked_cell(candidate):
+						continue
+					var candidate_pos: Vector3 = cell_to_world(candidate)
+					if not _world_segment_clear(from, candidate_pos, tree):
+						continue
+					var distance: float = from.distance_squared_to(candidate_pos)
+					if distance < best_distance:
+						entry = candidate
+						best_distance = distance
+			if best_distance < INF:
+				start = entry
+				start_anchor = cell_to_world(start)
+				start_anchor_clear = true
+				break
+	if start_outside and not start_anchor_clear:
+		report["search_reason"] = "outside_start_has_no_clear_entry"
+		return _record_path([Vector3(from.x, 0.0, from.z)], report)
 	if start == goal:
-		return [Vector3(to.x, 0, to.z)]
+		if not start_outside and not target_blocked and _world_segment_clear(cell_to_world(goal), to, tree):
+			report["search_reason"] = "same_cell_reaches_requested_goal"
+			report["search_reached_goal"] = true
+			return _record_path([Vector3(to.x, 0, to.z)], report)
+		report["search_reason"] = "same_cell_uses_legal_projection" if target_blocked else "same_cell_route"
+		report["search_reached_goal"] = true
+		return _record_path([start_anchor if start_outside else cell_to_world(goal)], report)
 	# Direct LOS → single waypoint
-	if _line_free(start, goal):
-		return [Vector3(to.x, 0, to.z)]
+	if not start_outside and _line_free(start, goal):
+		if not target_blocked and (not is_blocked_cell(world_to_cell(to)) or _world_segment_clear(cell_to_world(goal), to, tree)):
+			report["search_reason"] = "direct_grid_line"
+			report["search_reached_goal"] = true
+			return _record_path([Vector3(to.x, 0, to.z)], report)
+		if start_outside:
+			report["search_reason"] = "direct_line_to_legal_projection" if target_blocked else "direct_line_to_goal_cell"
+			report["search_reached_goal"] = true
+			return _record_path([start_anchor, cell_to_world(goal)], report)
+		report["search_reason"] = "direct_line_to_legal_projection" if target_blocked else "direct_line_to_goal_cell"
+		report["search_reached_goal"] = true
+		return _record_path([cell_to_world(goal)], report)
 	var open: Array = []  # {c, f, g}
 	var came: Dictionary = {}
 	var gscore: Dictionary = {}
@@ -247,6 +365,14 @@ static func find_path(from: Vector3, to: Vector3, tree: SceneTree) -> Array:
 				best_h = h
 				best_c = pc
 		goal = best_c
+	report["expanded_nodes"] = expand
+	report["remaining_open_nodes"] = open.size()
+	report["search_reached_goal"] = found
+	report["search_reason"] = "goal_cell_reached" if found else ("expand_budget_exhausted" if expand >= MAX_EXPAND else "open_set_exhausted")
+	if found:
+		report["reached_goal_cell"] = [goal.x, goal.y]
+	else:
+		report["partial_endpoint_cell"] = [goal.x, goal.y]
 	# Reconstruct
 	var cells: Array = []
 	var cur2: Vector2i = goal
@@ -262,20 +388,82 @@ static func find_path(from: Vector3, to: Vector3, tree: SceneTree) -> Array:
 	var wps: Array = []
 	for i in range(1, cells.size()):  # skip start cell
 		wps.append(cell_to_world(cells[i]))
-	# Final exact goal
-	if wps.is_empty() or wps[wps.size() - 1].distance_to(Vector3(to.x, 0, to.z)) > 0.4:
+	if start_outside and start_anchor_clear:
+		wps.push_front(start_anchor)
+	# Append the requested coordinate only when the search actually reached
+	# its cell and the requested cell itself is free. A blocked destination or
+	# a partial route must terminate at the last reachable free cell.
+	if wps.is_empty():
+		wps.append(cell_to_world(goal))
+	elif found and not target_blocked and _world_segment_clear(wps[wps.size() - 1], to, tree) and wps[wps.size() - 1].distance_to(Vector3(to.x, 0, to.z)) > 0.4:
 		wps.append(Vector3(to.x, 0.0, to.z))
-	return wps
+	return _record_path(wps, report)
+
+static func _world_position_blocked(p: Vector3, tree: SceneTree) -> bool:
+	return not _world_blockers_at(p, tree).is_empty()
+
+static func _world_blockers_at(p: Vector3, tree: SceneTree) -> Array[Dictionary]:
+	var blockers: Array[Dictionary] = []
+	if tree == null:
+		return blockers
+	for b in tree.get_nodes_in_group("buildings"):
+		if not is_instance_valid(b):
+			continue
+		if b.get("blocks_path") == false and b.get("is_wall") != true and b.get("is_gate") != true and b.get("is_tower") != true:
+			continue
+		if b.has_method("blocks_unit_at") and b.call("blocks_unit_at", p, "player", 0.45) == true:
+			blockers.append(_describe_blocker(b, "building"))
+	for r in tree.get_nodes_in_group("resources"):
+		if not is_instance_valid(r) or r.is_in_group("buildings") or r.is_in_group("farms"):
+			continue
+		if r.has_method("blocks_unit_at") and r.call("blocks_unit_at", p, 0.45) == true:
+			blockers.append(_describe_blocker(r, "resource"))
+	return blockers
+
+static func _describe_blocker(node: Node, category: String) -> Dictionary:
+	var result: Dictionary = {"category": category, "name": node.name, "class": node.get_class(), "position": node.global_position}
+	var script: Script = node.get_script() as Script
+	if script != null:
+		result["script"] = script.resource_path
+	var footprint: Variant = node.get("footprint")
+	if footprint is Vector3:
+		result["footprint"] = footprint
+	var block_radius: Variant = node.get("block_radius")
+	if block_radius != null:
+		result["block_radius"] = float(block_radius)
+	var bounds: Variant = node.get("bounds")
+	if bounds is Vector3:
+		result["bounds"] = bounds
+	if category == "resource" and node.has_method("res_key"):
+		result["resource_key"] = node.call("res_key")
+	return result
+
+static func _world_segment_clear(a: Vector3, b: Vector3, tree: SceneTree) -> bool:
+	var distance: float = Vector2(b.x - a.x, b.z - a.z).length()
+	var steps: int = maxi(1, ceili(distance / 0.2))
+	for i in range(steps + 1):
+		if _world_position_blocked(a.lerp(b, float(i) / float(steps)), tree):
+			return false
+	return true
 
 static func _nearest_free(c: Vector2i) -> Vector2i:
 	if not is_blocked_cell(c):
 		return c
-	for r in range(1, 8):
+	for r in range(1, _dim + 1):
+		var best: Vector2i = c
+		var best_distance: float = INF
 		for dx in range(-r, r + 1):
 			for dz in range(-r, r + 1):
+				if absi(dx) != r and absi(dz) != r:
+					continue
 				var n := Vector2i(c.x + dx, c.y + dz)
 				if _in_bounds(n) and not is_blocked_cell(n):
-					return n
+					var distance: float = float(dx * dx + dz * dz)
+					if distance < best_distance:
+						best = n
+						best_distance = distance
+		if best_distance < INF:
+			return best
 	return c
 
 static func _line_free(a: Vector2i, b: Vector2i) -> bool:
@@ -292,12 +480,22 @@ static func _line_free(a: Vector2i, b: Vector2i) -> bool:
 		if x == b.x and z == b.y:
 			break
 		var e2: int = 2 * err
+		var next_x: int = x
+		var next_z: int = z
 		if e2 > -dz:
 			err -= dz
-			x += sx
+			next_x += sx
 		if e2 < dx:
 			err += dx
-			z += sz
+			next_z += sz
+		# A diagonal LOS step must not squeeze through the corner of two
+		# blocked cells. A* already enforces this for grid neighbors; keep the
+		# direct-path shortcut and waypoint simplifier under the same rule.
+		if next_x != x and next_z != z:
+			if is_blocked_cell(Vector2i(next_x, z)) or is_blocked_cell(Vector2i(x, next_z)):
+				return false
+		x = next_x
+		z = next_z
 	return true
 
 static func _simplify(cells: Array) -> Array:

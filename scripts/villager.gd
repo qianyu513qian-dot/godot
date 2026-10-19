@@ -2,6 +2,8 @@ extends Node3D
 class_name Villager3D
 ## 3D villager: move / gather / return drop / build.
 
+signal diagnostic_harvested(worker_id: int, source_id: int, resource_key: String, amount: int, carry_before: int, carry_after: int, source_stock_before: int, source_stock_after: int)
+
 const Catalog := preload("res://scripts/building_catalog.gd")
 const Pathfind := preload("res://scripts/pathfind.gd")
 const Combat := preload("res://scripts/combat.gd")
@@ -38,9 +40,15 @@ var resume_key: String = ""
 var resume_resource: Node3D = null
 var build_site: Node3D = null
 var order_queue: Array = []  ## Shift-queued orders: {k, p?, n?}
+## A player-issued movement/work order is an explicit choice to keep moving or
+## working under fire instead of switching into an automatic counterattack.
+var manual_order_suppresses_auto_defense: bool = false
 
 var carry_key: String = ""
 var carry_amount: int = 0
+var wood_gather_multiplier: float = 1.0
+var wood_carry_bonus: int = 0
+var carry_capacity_bonus: int = 0
 var carry_capacity: int = 10  # AoE4 villager
 var gather_timer: float = 0.0
 var gather_rate: float = 0.55
@@ -173,18 +181,27 @@ func _update_hp_bar() -> void:
 	if mat:
 		mat.albedo_color = Color(0.25, 0.9, 0.3) if pct > 0.35 else Color(0.9, 0.25, 0.2)
 
-func take_damage(amount: float, _pierce: bool = false) -> void:
+func take_damage(amount: float, _pierce: bool = false, attacker: Node3D = null) -> void:
 	if not alive:
 		return
+	var previous_hp: float = hp
 	hp = maxf(0.0, hp - amount)
+	_notify_player_damage(attacker, previous_hp - hp)
 	_update_hp_bar()
 	# Defend: acquire attacker if idle/moving without gather/build
-	if alive and state != State.BUILD and state != State.GATHER and state != State.RETURN_DROP:
+	if alive and not manual_order_suppresses_auto_defense and state != State.BUILD and state != State.GATHER and state != State.RETURN_DROP:
 		var e: Node3D = Combat.find_nearest_enemy(self, team, Combat.VILL_ACQUIRE)
 		if e != null:
 			attack_target = e
 	if hp <= 0.0:
 		_die_vill()
+
+func _notify_player_damage(attacker: Node3D, actual_damage: float) -> void:
+	if team != "player" or actual_damage <= 0.0 or attacker == null or not is_instance_valid(attacker) or not Combat.is_hostile(attacker, self):
+		return
+	var main_game := get_tree().get_first_node_in_group("main_game")
+	if main_game != null and main_game.has_method("notify_player_entity_damaged"):
+		main_game.call("notify_player_entity_damaged", self, attacker, actual_damage, global_position)
 
 func _die_vill() -> void:
 	alive = false
@@ -251,6 +268,7 @@ func _finish_order() -> void:
 		state = State.IDLE
 
 func _exec_attack(target: Node3D) -> void:
+	manual_order_suppresses_auto_defense = false
 	gather_target = null
 	build_site = null
 	drop_target = null
@@ -259,6 +277,7 @@ func _exec_attack(target: Node3D) -> void:
 	state = State.MOVE
 
 func _exec_move(pos: Vector3) -> void:
+	manual_order_suppresses_auto_defense = true
 	gather_target = null
 	drop_target = null
 	resume_key = ""
@@ -269,6 +288,7 @@ func _exec_move(pos: Vector3) -> void:
 	state = State.MOVE
 
 func _exec_gather(node: Node3D) -> void:
+	manual_order_suppresses_auto_defense = true
 	gather_target = node
 	resume_resource = node
 	resume_key = _resource_key_of(node)
@@ -279,6 +299,7 @@ func _exec_gather(node: Node3D) -> void:
 	state = State.MOVE
 
 func _exec_build(site: Node3D) -> void:
+	manual_order_suppresses_auto_defense = true
 	build_site = site
 	gather_target = null
 	drop_target = null
@@ -340,6 +361,10 @@ func _set_move_goal(goal: Vector3) -> void:
 	var tree: SceneTree = get_tree()
 	if tree != null:
 		_waypoints = Pathfind.find_path(global_position, _goal_final, tree)
+		if not _waypoints.is_empty():
+			var route_end: Vector3 = _waypoints[_waypoints.size() - 1]
+			if route_end.distance_to(_goal_final) > 0.4:
+				_goal_final = route_end
 	if _waypoints.is_empty():
 		move_target = _goal_final
 	else:
@@ -358,6 +383,7 @@ func _advance_waypoint() -> void:
 
 func command_stop() -> void:
 	clear_order_queue()
+	manual_order_suppresses_auto_defense = false
 	gather_target = null
 	drop_target = null
 	resume_key = ""
@@ -461,9 +487,11 @@ func _do_move(delta: float) -> void:
 		_waypoints.clear()
 		if gather_target != null and is_instance_valid(gather_target) and build_site == null:
 			state = State.GATHER
+			manual_order_suppresses_auto_defense = false
 			gather_timer = 0.0
 		elif build_site != null and is_instance_valid(build_site):
 			state = State.BUILD
+			manual_order_suppresses_auto_defense = false
 		else:
 			_finish_order()  # arrive → next Shift order or IDLE
 		return
@@ -632,20 +660,28 @@ func _do_gather(delta: float) -> void:
 	if gather_timer >= gather_rate:
 		gather_timer = 0.0
 		var key: String = _resource_key_of(gather_target)
-		var room := carry_capacity - carry_amount
+		var capacity := carry_capacity + carry_capacity_bonus + (wood_carry_bonus if key == "wood" else 0)
+		var room := capacity - carry_amount
 		if room <= 0 or (carry_key != "" and carry_key != key):
 			_start_return()
 			return
 		var took: int = 0
+		var carry_before_harvest: int = carry_amount
+		var source_stock_before: int = int(gather_target.get("amount")) if gather_target.get("amount") != null else -1
+		var chunk := gather_chunk
+		if key == "wood":
+			chunk = maxi(1, int(ceil(float(gather_chunk) * maxf(wood_gather_multiplier, 1.0))))
 		if gather_target.has_method("harvest"):
-			took = int(gather_target.call("harvest", mini(gather_chunk, room)))
+			took = int(gather_target.call("harvest", mini(chunk, room)))
 		elif gather_target.has_method("harvest_meat"):
-			took = int(gather_target.call("harvest_meat", mini(gather_chunk, room)))
+			took = int(gather_target.call("harvest_meat", mini(chunk, room)))
 		if took > 0:
 			carry_key = key
 			carry_amount += took
 			_update_carry_label()
-		if carry_amount >= carry_capacity or took == 0:
+			var source_stock_after: int = int(gather_target.get("amount")) if gather_target.get("amount") != null else -1
+			diagnostic_harvested.emit(get_instance_id(), gather_target.get_instance_id(), key, took, carry_before_harvest, carry_amount, source_stock_before, source_stock_after)
+		if carry_amount >= capacity or took == 0:
 			_start_return()
 
 func _start_return() -> void:

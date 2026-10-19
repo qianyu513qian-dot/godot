@@ -4,14 +4,18 @@ class_name ArrowProjectile
 
 const Combat := preload("res://scripts/combat.gd")
 
+signal diagnostic_impact(attacker: Node3D, target: Node3D, damage: float, actual_damage: float, hp_before: float, hp_after: float)
+
 var _target: Node3D = null
+var _attacker: Node3D = null
 var _dmg: float = 8.0
 var _speed: float = 28.0
 var _life: float = 1.2
 var _mesh: MeshInstance3D
 
-func setup(from: Vector3, target: Node3D, dmg: float) -> void:
+func setup(from: Vector3, target: Node3D, dmg: float, attacker: Node3D = null) -> void:
 	_target = target
+	_attacker = attacker
 	_dmg = dmg
 	global_position = from
 	_mesh = MeshInstance3D.new()
@@ -50,5 +54,9 @@ func _process(delta: float) -> void:
 
 func _hit() -> void:
 	if _target != null and is_instance_valid(_target) and _target.has_method("take_damage"):
-		_target.call("take_damage", _dmg, true)
+		var attacker: Node3D = _attacker if is_instance_valid(_attacker) else null
+		var hp_before := float(_target.get("hp"))
+		_target.call("take_damage", _dmg, true, attacker)
+		var hp_after := float(_target.get("hp"))
+		diagnostic_impact.emit(attacker, _target, _dmg, maxf(0.0, hp_before-hp_after), hp_before, hp_after)
 	queue_free()

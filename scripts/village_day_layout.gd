@@ -4,6 +4,7 @@ class_name VillageDayLayout
 
 const LAYOUT_PATH := "res://assets/fantastic_village/env/village_day_layout.json"
 const PIECES_ROOT := "res://assets/fantastic_village/pieces/"
+const MaterialProfile := preload("res://scripts/village_material_profile.gd")
 const FALLBACK := {
 	"SM_BLD_body_v01_01": "res://assets/fantastic_village/town_center.glb",
 	"SM_BLD_body_v02_01": "res://assets/fantastic_village/house.glb",
@@ -25,7 +26,7 @@ var spawned: int = 0
 var missing: int = 0
 var layout_meta: Dictionary = {}
 
-func build() -> Dictionary:
+func build(progress_callback: Callable = Callable()) -> Dictionary:
 	if not FileAccess.file_exists(LAYOUT_PATH):
 		push_warning("VillageDayLayout missing JSON")
 		return {"ok": false, "spawned": 0}
@@ -39,33 +40,44 @@ func build() -> Dictionary:
 	if fit > 0.01 and absf(fit - 1.0) > 0.001:
 		scale = Vector3(fit, fit, fit)
 	var actors: Array = data.get("actors", [])
-	for a in actors:
+	for actor_index in actors.size():
+		var a: Variant = actors[actor_index]
 		if typeof(a) != TYPE_DICTIONARY:
-			continue
-		var mesh_name: String = str(a.get("mesh", ""))
-		var ps: PackedScene = _load_piece(mesh_name)
-		if ps == null:
-			missing += 1
-			continue
-		var inst: Node3D = ps.instantiate() as Node3D
-		if inst == null:
-			missing += 1
-			continue
-		inst.name = mesh_name + "_%d" % spawned
-		var pos_a: Array = a.get("pos", [0, 0, 0])
-		inst.position = Vector3(float(pos_a[0]), float(pos_a[1]), float(pos_a[2]))
-		# Flatten tiny height noise so gameplay ground stays walkable; keep >0.4m relative
-		if absf(inst.position.y) < 0.35:
-			inst.position.y = 0.0
-		var yaw: float = float(a.get("yaw", 0.0))
-		# UE Z-up yaw -> Godot Y-up (left-handed to right-handed: negate)
-		inst.rotation_degrees = Vector3(0.0, -yaw, 0.0)
-		var sc: Array = a.get("ue_scale", [1, 1, 1])
-		# Uniform-ish; UE scale XYZ maps after axis swap approximately
-		inst.scale = Vector3(float(sc[0]), float(sc[2]), float(sc[1]))
-		add_child(inst)
-		spawned += 1
-	return {"ok": true, "spawned": spawned, "missing": missing, "scale_fit": data.get("scale_fit", 1.0)}
+			pass
+		else:
+			var mesh_name: String = str(a.get("mesh", ""))
+			var ps: PackedScene = _load_piece(mesh_name)
+			if ps == null:
+				missing += 1
+			else:
+				var inst: Node3D = ps.instantiate() as Node3D
+				if inst == null:
+					missing += 1
+				else:
+					inst.name = mesh_name + "_%d" % spawned
+					var pos_a: Array = a.get("pos", [0, 0, 0])
+					inst.position = Vector3(float(pos_a[0]), float(pos_a[1]), float(pos_a[2]))
+					# Flatten tiny height noise so gameplay ground stays walkable; keep >0.4m relative
+					if absf(inst.position.y) < 0.35:
+						inst.position.y = 0.0
+					var yaw: float = float(a.get("yaw", 0.0))
+					# UE Z-up yaw -> Godot Y-up (left-handed to right-handed: negate)
+					inst.rotation_degrees = Vector3(0.0, -yaw, 0.0)
+					var sc: Array = a.get("ue_scale", [1, 1, 1])
+					# Uniform-ish; UE scale XYZ maps after axis swap approximately
+					inst.scale = Vector3(float(sc[0]), float(sc[2]), float(sc[1]))
+					add_child(inst)
+					spawned += 1
+		if (actor_index + 1) % 32 == 0:
+			if progress_callback.is_valid():
+				progress_callback.call(actor_index + 1, actors.size())
+			await get_tree().process_frame
+	if progress_callback.is_valid():
+		progress_callback.call(actors.size(), actors.size())
+	var material_stats: Dictionary = MaterialProfile.apply_to(self)
+	set_meta("source_material_stats", material_stats)
+	print("[AoELite3D] source material bindings ", material_stats)
+	return {"ok": true, "spawned": spawned, "missing": missing, "scale_fit": data.get("scale_fit", 1.0), "material_profile": material_stats}
 
 func _load_piece(mesh_name: String) -> PackedScene:
 	if _cache.has(mesh_name):

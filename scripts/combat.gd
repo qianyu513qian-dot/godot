@@ -58,13 +58,12 @@ static func find_nearest_enemy(from: Node3D, my_team: String, radius: float) -> 
 			if d < best_d:
 				best_d = d
 				best = u
-	# Hostile buildings (optional targets)
+	# Hostile buildings, including unfinished foundations. Foundations stay
+	# attackable so the last surviving construction site cannot soft-lock a match.
 	for b in tree.get_nodes_in_group("buildings"):
 		if not (b is Node3D) or not is_alive(b):
 			continue
 		if team_of(b) == my_team or team_of(b) == "":
-			continue
-		if b.get("is_complete") == false:
 			continue
 		var d2: float = xz_dist(from, b)
 		if d2 < best_d:

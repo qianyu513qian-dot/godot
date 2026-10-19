@@ -66,6 +66,8 @@ var _rally_line: MeshInstance3D = null
 
 var _mesh: MeshInstance3D
 var _select_ring: MeshInstance3D
+var _attack_range_ring: MeshInstance3D
+var _attack_range_suppressed: bool = false
 var _name_label: Label3D
 var _hub_ring: MeshInstance3D
 var _hub_force_show: bool = false
@@ -107,6 +109,7 @@ func setup(p_kind: int, pos: Vector3, p_team: String = "player", complete: bool 
 	else:
 		build_progress = build_time
 	_build_visual()
+	_ensure_attack_range_ring()
 	_ensure_build_bar()
 	_apply_construction_visual()
 	set_selected(false)
@@ -333,10 +336,77 @@ func set_selected(v: bool) -> void:
 	selected = v
 	if _select_ring:
 		_select_ring.visible = v
+	_update_attack_range_ring_visibility()
 	# No hub ring overlay 鈥?coverage is ground creep
 	# Rally uses global_position / look_at 鈥?only when in tree
 	if has_rally and is_inside_tree():
 		_update_rally_visuals()
+
+func _ensure_attack_range_ring() -> void:
+	if not is_tower or _attack_range_ring != null:
+		return
+	_attack_range_ring = MeshInstance3D.new()
+	_attack_range_ring.name = "AttackRangeXZ"
+	var tor := TorusMesh.new()
+	tor.inner_radius = maxf(0.05, attack_range - 0.055)
+	tor.outer_radius = attack_range + 0.055
+	tor.rings = 96
+	tor.ring_segments = 6
+	_attack_range_ring.mesh = tor
+	_attack_range_ring.position.y = 0.11
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.28, 0.12, 0.78)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_DISABLED
+	mat.render_priority = 1
+	_attack_range_ring.material_override = mat
+	_attack_range_ring.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_attack_range_ring.visible = false
+	add_child(_attack_range_ring)
+
+func _update_attack_range_ring_visibility() -> void:
+	if _attack_range_ring != null:
+		_attack_range_ring.visible = is_tower and team == "player" and is_complete and selected and not _attack_range_suppressed and alive
+
+func set_attack_range_overlay_suppressed(suppressed: bool) -> void:
+	_attack_range_suppressed = suppressed
+	_update_attack_range_ring_visibility()
+
+func get_tower_ui_state() -> Dictionary:
+	if not is_tower:
+		return {}
+	if not is_complete:
+		return {"state":"unfinished", "text":"未完工：完成后才会索敌"}
+	var nearest_distance: float = INF
+	var nearest_target_id: int = 0
+	var in_range_target: Node3D = null
+	var in_range_count: int = 0
+	for group_name in ["player_units", "enemy_units", "buildings"]:
+		for candidate in get_tree().get_nodes_in_group(group_name):
+			if not (candidate is Node3D) or candidate == self or not Combat.is_hostile(self, candidate):
+				continue
+			var distance: float = Combat.xz_dist(self, candidate)
+			if distance < nearest_distance:
+				nearest_distance = distance
+				nearest_target_id = candidate.get_instance_id()
+			if distance < attack_range:
+				in_range_count += 1
+				if in_range_target == null or distance < Combat.xz_dist(self, in_range_target):
+					in_range_target = candidate
+	var projectiles_in_flight: int = 0
+	for projectile in get_tree().get_nodes_in_group("arrows"):
+		if projectile.get("_attacker") == self and projectile.get("_target") != null and Combat.is_alive(projectile.get("_target")):
+			projectiles_in_flight += 1
+	if projectiles_in_flight > 0:
+		return {"state":"firing", "target_id":nearest_target_id, "text":"正在射击：箭矢飞行中 ×%d" % projectiles_in_flight}
+	if in_range_target != null:
+		if _tower_cd > 0.0:
+			return {"state":"cooldown", "target_id":in_range_target.get_instance_id(), "text":"射程内有目标 · 冷却中"}
+		return {"state":"ready", "target_id":in_range_target.get_instance_id(), "text":"可攻击：射程内有目标"}
+	if nearest_target_id != 0:
+		return {"state":"out_of_range", "target_id":nearest_target_id, "text":"射程外：最近敌人 %.2fm" % nearest_distance}
+	return {"state":"no_target", "target_id":0, "text":"无敌方目标"}
 
 
 func set_hub_overlay_visible(_v: bool) -> void:
@@ -813,6 +883,7 @@ func _finish_construction() -> void:
 			add_to_group("resources")
 	_apply_construction_visual()
 	_update_build_bar()
+	_update_attack_range_ring_visibility()
 	Hub.invalidate()
 	Pathfind.invalidate()
 	if is_wall or is_gate or is_tower:
@@ -1116,10 +1187,16 @@ func _update_rally_visuals() -> void:
 	if dist > 0.05 and _rally_line.is_inside_tree():
 		_rally_line.look_at(bpos, Vector3.UP)
 
-func take_damage(amount: float, _pierce: bool = false) -> void:
-	if not alive or not is_complete:
+func take_damage(amount: float, _pierce: bool = false, attacker: Node3D = null) -> void:
+	if not alive:
 		return
+	var previous_hp: float = hp
 	hp = maxf(0.0, hp - amount)
+	var actual_damage: float = previous_hp - hp
+	if team == "player" and actual_damage > 0.0 and attacker != null and is_instance_valid(attacker) and Combat.is_hostile(attacker, self):
+		var main_game := get_tree().get_first_node_in_group("main_game")
+		if main_game != null and main_game.has_method("notify_player_entity_damaged"):
+			main_game.call("notify_player_entity_damaged", self, attacker, actual_damage, global_position)
 	if hp <= 0.0:
 		alive = false
 		# Simple ruin: free after brief delay via process flag
@@ -1150,5 +1227,5 @@ func _launch_arrow(target: Node3D, dmg: float) -> void:
 	if parent_n == null:
 		parent_n = get_tree().current_scene
 	parent_n.add_child(arrow)
-	arrow.setup(from, target, dmg)
+	arrow.setup(from, target, dmg, self)
 

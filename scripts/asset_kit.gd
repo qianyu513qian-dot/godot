@@ -9,6 +9,7 @@ const ROOT := "res://assets/fantastic_village/"
 const PIECES := "res://assets/fantastic_village/pieces/"
 const FALLBACK_ROOT := "res://assets/models/"
 const ENV := "res://assets/fantastic_village/env/"
+const MaterialProfile := preload("res://scripts/village_material_profile.gd")
 
 ## gameplay key -> primary GLB (relative to ROOT unless starts with pieces/ or res://)
 const MAP := {
@@ -52,10 +53,12 @@ const NATIVE := {
 	"farm": Vector3(5.5, 1.2, 5.5),
 	"gold": Vector3(2.6, 1.8, 2.4),
 	"stone": Vector3(2.8, 1.9, 2.5),
-	"villager": Vector3(0.9, 1.7, 0.7),
-	"soldier": Vector3(0.95, 1.7, 0.95),
-	"enemy": Vector3(0.95, 1.7, 0.95),
-	"zombie": Vector3(0.95, 1.7, 0.95),
+	# Source character GLBs are Z-up. These are measured extents after the runtime
+	# wrapper rotates the source's Z axis onto gameplay Y.
+	"villager": Vector3(0.84, 1.59, 0.80),
+	"soldier": Vector3(0.80, 1.772, 0.80),
+	"enemy": Vector3(0.80, 1.772, 0.80),
+	"zombie": Vector3(0.80, 1.772, 0.80),
 }
 
 ## Human-readable pack source for docs / selftest.
@@ -82,6 +85,7 @@ const PACK_SOURCE := {
 }
 
 static var _cache: Dictionary = {}
+static var _unit_vertex_material: StandardMaterial3D = null
 
 static func mapping_table() -> String:
 	var lines: PackedStringArray = PackedStringArray()
@@ -162,7 +166,79 @@ static func attach(parent: Node3D, key: String, target_size: Vector3 = Vector3.Z
 	_fit_scale(root, key, target_size)
 	root.position = Vector3(0, y_lift, 0)
 	_enable_shadows(root)
+	if key in ["villager", "soldier", "enemy", "zombie"]:
+		_adapt_unit_axes_and_normals(root)
+		_apply_unit_vertex_colors(root)
 	return root
+
+static func _adapt_unit_axes_and_normals(root: Node3D) -> void:
+	## Character GLBs are authored Z-up, while gameplay uses Y-up. Keep the source
+	## mesh intact and apply a reversible root wrapper transform per instance.
+	root.rotation = Vector3(-PI * 0.5, 0.0, 0.0)
+	var nodes: Array[Node] = [root]
+	nodes.append_array(root.find_children("*", "MeshInstance3D", true, false))
+	for node in nodes:
+		if not node is MeshInstance3D:
+			continue
+		var mesh_instance := node as MeshInstance3D
+		if mesh_instance.mesh is ArrayMesh:
+			mesh_instance.mesh = _mesh_with_derived_normals(mesh_instance.mesh as ArrayMesh)
+
+static func _mesh_with_derived_normals(source: ArrayMesh) -> ArrayMesh:
+	var derived := ArrayMesh.new()
+	for surface in source.get_surface_count():
+		var arrays := source.surface_get_arrays(surface)
+		if arrays.size() <= Mesh.ARRAY_NORMAL:
+			continue
+		var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX] if arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array else PackedVector3Array()
+		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] is PackedInt32Array else PackedInt32Array()
+		var normals: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL] if arrays[Mesh.ARRAY_NORMAL] is PackedVector3Array else PackedVector3Array()
+		if normals.size() == 0 and vertices.size() > 0:
+			normals.resize(vertices.size())
+			for vertex_index in normals.size():
+				normals[vertex_index] = Vector3.ZERO
+			var triangle_count := indices.size() if indices.size() > 0 else vertices.size()
+			for triangle_start in range(0, triangle_count - 2, 3):
+				var i0 := indices[triangle_start] if indices.size() > 0 else triangle_start
+				var i1 := indices[triangle_start + 1] if indices.size() > 0 else triangle_start + 1
+				var i2 := indices[triangle_start + 2] if indices.size() > 0 else triangle_start + 2
+				if i0 >= vertices.size() or i1 >= vertices.size() or i2 >= vertices.size():
+					continue
+				var face_normal := (vertices[i1] - vertices[i0]).cross(vertices[i2] - vertices[i0])
+				if face_normal.length_squared() <= 0.00000001:
+					continue
+				normals[i0] += face_normal
+				normals[i1] += face_normal
+				normals[i2] += face_normal
+			for vertex_index in normals.size():
+				normals[vertex_index] = normals[vertex_index].normalized()
+			arrays[Mesh.ARRAY_NORMAL] = normals
+		derived.add_surface_from_arrays(source.surface_get_primitive_type(surface), arrays)
+		derived.surface_set_material(surface, source.surface_get_material(surface))
+	return derived
+
+static func _apply_unit_vertex_colors(root: Node3D) -> void:
+	## The fallback character GLBs contain authored COLOR_0 palettes but no materials.
+	## Godot's default white material ignores those colors unless this flag is enabled.
+	if _unit_vertex_material == null:
+		_unit_vertex_material = StandardMaterial3D.new()
+		# Keep the authored palette from washing out under the game's directional sun.
+		_unit_vertex_material.albedo_color = Color(0.72, 0.72, 0.72)
+		_unit_vertex_material.vertex_color_use_as_albedo = true
+		_unit_vertex_material.vertex_color_is_srgb = false
+		_unit_vertex_material.roughness = 0.86
+		_unit_vertex_material.metallic = 0.0
+		_unit_vertex_material.cull_mode = BaseMaterial3D.CULL_BACK
+	var nodes: Array[Node] = [root]
+	nodes.append_array(root.find_children("*", "MeshInstance3D", true, false))
+	for node in nodes:
+		if not node is MeshInstance3D:
+			continue
+		var mesh_instance := node as MeshInstance3D
+		if mesh_instance.mesh == null:
+			continue
+		for surface in mesh_instance.mesh.get_surface_count():
+			mesh_instance.set_surface_override_material(surface, _unit_vertex_material)
 
 static func _fit_scale(root: Node3D, key: String, target_size: Vector3) -> void:
 	var native: Vector3 = NATIVE.get(key, Vector3(1, 1, 1))
@@ -313,6 +389,7 @@ static func _tint_subtree(node: Node, tint: Color) -> void:
 		mi.material_override = mat
 
 static func _enable_shadows(node: Node) -> void:
+	MaterialProfile.apply_to(node)
 	for child in node.find_children("*", "MeshInstance3D", true, false):
 		var mi := child as MeshInstance3D
 		if mi == null:

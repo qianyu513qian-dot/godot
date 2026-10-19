@@ -1,6 +1,7 @@
 ﻿extends Node3D
 class_name ResourceNode3D
 const Assets := preload("res://scripts/asset_kit.gd")
+const Pathfind := preload("res://scripts/pathfind.gd")
 ## Map resource (tree / stone / gold). Meat comes from farms.
 
 enum Kind { WOOD, STONE, GOLD }
@@ -15,6 +16,28 @@ var _mesh: MeshInstance3D
 var _label: Label3D
 var selected: bool = false
 var _select: MeshInstance3D = null
+var _depleted_for_navigation: bool = false
+var _navigation_owner_ref: WeakRef = null
+
+func _ready() -> void:
+	var main: Node = get_tree().get_first_node_in_group("main_game")
+	if main != null:
+		_navigation_owner_ref = weakref(main)
+
+func _exit_tree() -> void:
+	# Harvest depletion removes a blocker during live play. Ordinary scene
+	# teardown must not invalidate the outgoing navigation grid.
+	if not _depleted_for_navigation or not is_queued_for_deletion():
+		return
+	var main: Node = _navigation_owner_ref.get_ref() if _navigation_owner_ref != null else null
+	if main == null or not is_instance_valid(main):
+		return
+	if bool(main.get("_world_teardown_in_progress")) or not bool(main.get("_match_started")):
+		return
+	var active_world: Node = main.get("world")
+	if active_world == null or not is_instance_valid(active_world) or not active_world.is_inside_tree() or not active_world.is_ancestor_of(self):
+		return
+	Pathfind.invalidate()
 
 func setup(p_kind: Kind, pos: Vector3, p_amount: int = 200) -> void:
 	kind = p_kind
@@ -48,6 +71,7 @@ func harvest(chunk: int) -> int:
 	amount -= took
 	_update_label()
 	if amount <= 0:
+		_depleted_for_navigation = true
 		queue_free()
 	return took
 
